@@ -200,53 +200,92 @@ void handleRTSP() {
 
 // HTTP MJPEG Stream Handler
 void handleStream() {
-  camera_fb_t * fb = NULL;
-  
   WiFiClient client = server.client();
+  
+  if (!client) {
+    Serial.println("No client available");
+    return;
+  }
+  
+  Serial.println("New streaming client connected");
+  
   String response = "HTTP/1.1 200 OK\r\n";
-  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n";
+  response += "Access-Control-Allow-Origin: *\r\n";
+  response += "Cache-Control: no-cache, no-store, must-revalidate\r\n";
+  response += "Pragma: no-cache\r\n\r\n";
   client.print(response);
+  client.flush();
 
+  camera_fb_t * fb = NULL;
   unsigned long lastFrameTime = 0;
+  unsigned long nextFrameTime = 0;
+  bool firstFrame = true;
 
   while (client.connected()) {
-    fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("Camera capture failed");
-      break;
-    }
-
     unsigned long currentTime = millis();
     
-    // Calculate FPS
-    if (lastFrameTime > 0) {
-      unsigned long frameInterval = currentTime - lastFrameTime;
-      if (frameInterval > 0) {
-        streamStats.currentFPS = 1000.0 / frameInterval;
+    if (firstFrame || currentTime >= nextFrameTime) {
+      fb = esp_camera_fb_get();
+      if (!fb) {
+        Serial.println("Camera capture failed");
+        delay(10);
+        continue;
       }
+
+      // Calculate FPS
+      if (lastFrameTime > 0) {
+        unsigned long frameInterval = currentTime - lastFrameTime;
+        if (frameInterval > 0) {
+          streamStats.currentFPS = 1000.0 / frameInterval;
+        }
+      }
+      
+      // Update statistics
+      streamStats.frameCount++;
+      streamStats.totalBytes += fb->len;
+      streamStats.lastFrameTime = currentTime;
+      streamStats.lastFrameSize = fb->len;
+      lastFrameTime = currentTime;
+
+      // Send frame header
+      client.print("--frame\r\n");
+      client.print("Content-Type: image/jpeg\r\n");
+      client.print("Content-Length: " + String(fb->len) + "\r\n\r\n");
+      
+      // Send frame data in chunks for smooth continuous delivery
+      size_t sent = 0;
+      const size_t chunkSize = 1024;
+      while (sent < fb->len && client.connected()) {
+        size_t toSend = (fb->len - sent < chunkSize) ? (fb->len - sent) : chunkSize;
+        client.write(fb->buf + sent, toSend);
+        client.flush();
+        sent += toSend;
+        yield();
+      }
+      
+      client.print("\r\n");
+      client.flush();
+
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      
+      // Schedule next frame for smooth timing
+      nextFrameTime = currentTime + FRAME_DELAY_MS;
+      firstFrame = false;
+    } else {
+      // Small delay to prevent CPU spinning, but allow other tasks
+      delay(1);
+      yield();
     }
-    
-    // Update statistics
-    streamStats.frameCount++;
-    streamStats.totalBytes += fb->len;
-    streamStats.lastFrameTime = currentTime;
-    streamStats.lastFrameSize = fb->len;
-    lastFrameTime = currentTime;
-
-    client.print("--frame\r\n");
-    client.print("Content-Type: image/jpeg\r\n");
-    client.print("Content-Length: " + String(fb->len) + "\r\n\r\n");
-    client.write(fb->buf, fb->len);
-    client.print("\r\n");
-
-    esp_camera_fb_return(fb);
-    fb = NULL;
-    delay(FRAME_DELAY_MS); // ~3 FPS
   }
+  
+  Serial.println("Streaming client disconnected");
 }
 
 // Stats endpoint handler
 void handleStats() {
+  Serial.println("Stats request received");
   String resolution = "Unknown";
   
   // Get resolution string based on frame size
@@ -279,6 +318,7 @@ void handleStats() {
 }
 
 void handleRoot() {
+  Serial.println("Root request received");
   String html = R"HTML_STRING(
 <!DOCTYPE html>
 <html>
@@ -529,13 +569,18 @@ void handleRoot() {
     }
     
     setInterval(refreshStream, 30000);
-    setInterval(updateStats, 1000);
+    setInterval(updateStats, 3000);
     updateStats();
   </script>
 </body>
 </html>
 )HTML_STRING";
-  html.replace("IP_ADDRESS", WiFi.localIP().toString());
+  
+  String ipAddress = WiFi.localIP().toString();
+  while (html.indexOf("IP_ADDRESS") >= 0) {
+    html.replace("IP_ADDRESS", ipAddress);
+  }
+  
   server.send(200, "text/html", html);
 }
 
@@ -550,12 +595,25 @@ void setup() {
   Serial.println("Camera initialized successfully");
 
   connectWiFi();
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, cannot start server");
+    return;
+  }
 
   server.on("/", handleRoot);
   server.on("/stream", handleStream);
   server.on("/stats", handleStats);
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Not Found");
+  });
+  
   server.begin();
+  delay(100);
   Serial.println("HTTP server started");
+  Serial.print("Access the web interface at: http://");
+  Serial.println(WiFi.localIP());
+  Serial.println("Waiting for client connections...");
 
   udp.begin(RTSP_PORT);
   Serial.print("RTSP server started on rtsp://");
@@ -566,8 +624,13 @@ void setup() {
 }
 
 void loop() {
-  server.handleClient();
-  handleRTSP();
+  if (WiFi.status() == WL_CONNECTED) {
+    server.handleClient();
+    handleRTSP();
+  } else {
+    Serial.println("WiFi disconnected, reconnecting...");
+    connectWiFi();
+  }
   
   // Send RTP video packets if client is connected
   if (rtspClientConnected) {
